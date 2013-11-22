@@ -1,0 +1,390 @@
+#!/usr/bin/perl
+##############################################################################
+#
+# Copyright (C) 2013 Contributor
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+##############################################################################
+#
+# pkgtree
+# Author: Mark R. Bannister
+#
+# Displays IPS package dependency tree.
+#
+##############################################################################
+
+use strict;
+use warnings;
+
+use File::Basename;
+use Getopt::Long qw{:config bundling no_ignore_case no_auto_abbrev};
+use Pod::Usage;
+use FindBin;
+
+use lib "$FindBin::RealBin/../lib/perl5";
+use IPS qw(load_tree load_tree_repo list_dependants list_depends
+           list_no_dependants);
+
+use constant VERSION => '1.1';
+
+umask(022);
+
+##############################################################################
+# csv_to_subhash(<hash>, <option>)
+#
+# Convert comma-separated option in given hash to a subhash.
+##############################################################################
+sub csv_to_subhash
+{
+    my ($hash, $option) = @_;
+
+    return if !$hash->{$option};
+
+    my %subhash;
+    for my $s (split /,/, $hash->{$option}) {
+        $subhash{$s} = 1;
+    }
+    $hash->{$option} = \%subhash;
+}
+
+#
+# Parse command-line options
+#
+my %args;
+GetOptions(\%args,
+        qw(allow-repeats|a!
+           no-cache|C!
+           clear-cache|c!
+           debug|D=i
+           names|e!
+           force-cache|F!
+           cache-file|f=s
+           help|h!
+           latest|l!
+           max-depth|depth|m|d=i
+           ntype|n=s
+           no-pager|P!
+           recurse|r!
+           type|t=s
+           no-colour|no-color|U!
+           version|v!
+           exact|x!
+           types|y!)
+        ) or pod2usage(-verbose => 0);
+
+if ($args{version}) {
+    print "$IPS::CALL v" . VERSION . "\n";
+    exit 0;
+}
+
+pod2usage(-verbose => 3, -exitval => 0) if $args{help};
+pod2usage(-verbose => 0) if @ARGV < 1 or @ARGV > 2;
+
+my $op = $ARGV[0];
+pod2usage(-verbose => 0) if $op !~ /^(depends|dependants|no-dependants)$/;
+
+if ($args{latest} and ($op ne 'depends' or @ARGV == 1)) {
+    print STDERR "$IPS::CALL --latest only valid for " .
+                 "depends view with pkg_fmri\n";
+    pod2usage(-verbose => 0);
+}
+
+if (@ARGV == 2) {
+    my $pkg = $ARGV[1];
+    ($args{pkg} = $pkg) =~ s/@.*$//;
+    ($args{ver} = $pkg) =~ s/^.*@// if $pkg =~ /@/;
+}
+
+$IPS::DEBUG = $args{debug} if $args{debug};
+$args{'cache-file'} ||= IPS::CACHE_FILE if !$args{latest};
+$args{'no-cache'} ||= !IPS::USE_CACHE;
+unlink($args{'cache-file'}) if $args{'clear-cache'} and $args{'cache-file'};
+
+csv_to_subhash(\%args, 'type');
+csv_to_subhash(\%args, 'ntype');
+
+#
+# If STDOUT is not connected to a terminal or --no-colour was specified
+# then don't use ANSI colours
+#
+$ENV{ANSI_COLORS_DISABLED} = 1 if ! -t STDOUT or $args{'no-colour'};
+
+#
+# Load data into the global package hashes
+#
+if (!$args{latest}) {
+    load_tree(cache => $args{'cache-file'},
+              use_cache => !$args{'no-cache'},
+              force_cache => $args{'force-cache'});
+} else {
+    #
+    # If generating a depends view with the --latest option, then
+    # we need to initialise the hashes in a slightly different way
+    #
+    load_tree_repo(cachedir => $args{'cache-file'},
+                   use_cache => !$args{'no-cache'},
+                   force_cache => !$args{'cache-cache'},
+                   pkg => $args{pkg}, ver => $args{ver},
+                   type => $args{type}, ntype => $args{ntype},
+                   recurse => $args{recurse},
+                   'max-depth' => $args{'max-depth'});
+}
+
+delete $args{latest};
+delete $args{debug};
+delete $args{'cache-file'};
+delete $args{'force-cache'};
+delete $args{'no-cache'};
+delete $args{'no-pager'};
+delete $args{'no-colour'};
+
+my @output;
+if ($args{pkg} and !IPS::Tree::get_installed_fmri($args{pkg}, 1)) {
+    print STDERR "$IPS::CALL: package '$args{pkg}' not found\n";
+    exit 1;
+}
+
+#
+# Process the hashes according to the options selected
+# on the command-line
+#
+if ($op eq 'depends') {
+    @output = list_depends(%args);
+} elsif ($op eq 'no-dependants') {
+    @output = list_no_dependants(%args);
+} else {
+    @output = list_dependants(%args);
+}
+
+#
+# If STDOUT is connected to a terminal and --no-pager was not specified
+# then send the result to the pager
+#
+if (-t STDOUT and !$args{'--no-pager'}) {
+    my $pager = $ENV{PAGER} || 'less';
+
+    #
+    # If PAGER is less and we are colourising then
+    # we need to add the -R option
+    #
+    $pager .= " -R" if ($pager =~ /^less/ and !$ENV{ANSI_COLORS_DISABLED});
+
+    open(my $cmd, "|-", "$pager") or die "$IPS::CALL: cannot open '$pager': $!";
+    print $cmd @output;
+    close $cmd;
+    die "$IPS::CALL: bad exit status from '$pager': $!" if $? >> 8;
+} else {
+    print @output;
+}
+
+exit 0;
+
+__END__
+
+=head1 NAME
+
+pkgtree - Display and query IPS package dependency tree
+
+=head1 SYNOPSIS
+
+B<pkgtree> [B<-a>|B<--allow-repeats>] [B<-C>|B<--no-cache>]
+        [B<-c>|B<--clear-cache>] [B<-D>|B<--debug> I<level>]
+        [B<-d>|B<--depth> I<level>] [B<-e>|B<--names>]
+        [B<-F>|B<--force-cache>] [B<-f>|B<--cache-file> I<file>]
+        [B<-l>|B<--latest>] [B<-m>|B<--max-depth> I<level>]
+        [B<-n>|B<--ntype> I<list>] [B<-P>|B<--no-pager>]
+        [B<-r>|B<--recurse>] [B<-t>|B<--type> I<list>]
+        [B<-U>|B<--no-colour>|B<--no-color>]
+        [B<-x>|B<--exact>] [B<-y>|B<--types>]
+        B<{depends|dependants|no-dependants}> [I<pkg_fmri>]
+
+B<pkgtree> [B<-h>|B<--help>]
+
+B<pkgtree> [B<-v>|B<--version>]
+
+=head1 DESCRIPTION
+
+B<pkgtree> displays the IPS package dependency tree.  It takes package
+information from the running system, caches it, then displays
+dependency information for all packages or for an individual
+package selected by I<pkg_fmri>.
+
+There are three main views that can be obtained from B<pkgtree>.  The first
+is a list of packages and what they depend on (the B<depends> command).
+The second is a list of packages and what depends on them (the
+B<dependants> command).  The third is a list of packages on which no
+other package depends (the B<no-dependants> command).
+
+Each view may be affected by applying a variety of filters.
+See B<OPTIONS> below.
+
+The I<pkg_fmri> may be a partial or full FMRI as described in
+B<pkg>(5), and may optionally omit versioning information.  Where
+present, the version number will filter on packages that depend
+on the given version or earlier.  Use B<-x> if an exact version
+match is desired.
+
+B<pkgtree> adds colour to aid readability if the output is going
+to a terminal.  Colours are selected from a palette of five,
+and these may be changed by setting the environment variables
+B<PKGTREE_COL1> to B<PKGTREE_COL5> respectively.  Colour codes
+accepted are those used by B<Term::ANSIColor>.  The B<-U>
+option may be used if colour is not desired.
+
+=head1 OPTIONS
+
+The following options are supported:
+
+=over 5
+
+=item B<-a>|B<--allow-repeats>
+
+When recursing (B<-r>), to reduce the output and compute time a package
+will only be expanded once.  If the package is listed as a dependency again,
+it is not expanded by default, instead a double asterisk (**) is
+included at the end of the line.  Alternatively this option disables
+the behaviour, which means that packages will be expanded each and
+every time they are encountered.  If specifying B<-a> you may also
+wish to couple it with B<-m> to control compute time.
+
+=item B<-C>|B<--no-cache>
+
+Don't use a cache file.  Start-up time for B<pkgtree> will be increased
+as it will launch B<pkg contents> each and every invocation.
+
+=item B<-c>|B<--clear-cache>
+
+Normally B<pkgtree> can detect if its cache file is possibly out of date
+due to changes in the B</var/pkg/state/installed> directory.  However,
+you may also force removal of the cache file with this option, so that
+the cache file is refreshed.  Start-up time for B<pkgtree> will be
+longer with this option, as it re-launches B<pkg contents>.
+
+=item B<-D>|B<--debug> I<level>
+
+Turn on debugging and set to given I<level>, which can be 1 to 3 for
+increased verbosity.
+
+=item B<-d>|B<--depth> I<level>
+
+See B<-m>.
+
+=item B<-e>|B<--names>
+
+Displays list of unique package FMRIs encountered during the query operation
+without reporting dependency types or visualising relationships by indentation.
+
+=item B<-F>|B<--force-cache>
+
+If a cache file is being used but it is detected as stale due to changes
+in the B</var/pkg/state/installed> directory, then the cache will be cleared.
+Use this option to force use of the cache file, even if it is stale.
+
+=item B<-f>|B<--cache-file> I<file>
+
+Specify an alternative path for the cache file.  The default
+is B</var/tmp/pkgtree.>I<username>.B<cache>.
+
+=item B<-h>|B<--help>
+
+Display this help page.
+
+=item B<-l>|B<--latest>
+
+Process latest packages from the package repositories and not those installed
+on the system.  By default, B<pkgtree> processes installed packages only.
+This option is only valid for the B<depends> view when I<pkg_fmri> is provided.
+It is not supported for B<dependants> or B<no-dependants>.  When this option is
+specified, no cache file is used by default.  To use a cache file, you must
+provide the B<-f> option and specify a directory.  Note that with the B<-l>
+option you must provide a directory name for the cache, not a file name.
+
+=item B<-m>|B<--max-depth> I<level>
+
+Set maximum level when recursing (B<-r>), where level 1 allows one
+level of recursion, level 2 allows two levels and so on.  Level 0
+effectively disables recursion.  This option may also be invoked
+as B<-d>.  By default there is no maximum depth.
+
+If a package would have been expanded but was limited by this option,
+a double chevron (>>) will be displayed on the end of the line.
+
+=item B<-n>|B<--ntype> I<list>
+
+A comma-separated list of package dependency types that are B<not>
+to be included in the output.  These dependency types are filtered
+out.  Valid dependency types are given in B<pkg>(5).
+
+=item B<-P>|B<--no-pager>
+
+By default, if STDOUT is not a terminal, the output of B<pkgtree>
+is sent to B<less>, or the pager named by the B<PAGER> environment
+variable if given.  This option disables the pager.
+
+=item B<-r>|B<--recurse>
+
+Show dependencies recursively.  Packages listed with
+a B<require> or B<require-any> dependency will in turn have
+their dependencies expanded subject to the rules of maximum
+recursion depth (B<-m>) and repeats (B<-a>).
+
+When used with B<no-dependants>, for all packages that match the filter,
+test for ring fenced dependencies and report all additional FMRIs that
+are not required by any external package.  This is helpful to determine,
+if a leaf package were to be removed, which other packages could also
+be removed as nothing else depends on them.
+
+=item B<-t>|B<--type> I<list>
+
+A comma-separated list of package dependency types that B<are>
+to be included in the output.  All other dependency types are
+filtered out.  Valid dependency types are given in B<pkg>(5).
+
+=item B<-v>|B<--version>
+
+Display version number.
+
+=item B<-U>|B<--no-colour>|B<--no-color>
+
+Does not emit ANSI terminal escape sequences for output
+colourising.  This may also be achieved by setting the
+environment variable B<ANSI_COLORS_DISABLED>.  By default
+colour sequences will be emitted unless output is not going
+to a terminal.
+
+=item B<-x>|B<--exact>
+
+Turns on exact version matching.  See B<DESCRIPTION>.
+
+=item B<-y>|B<--types>
+
+Same as B<-e> except additionally reports each dependency type.
+
+=back
+
+=head1 FILES
+
+=over 5
+
+=item B</var/tmp/pkgtree.>I<username>.B<cache>
+
+Default cache file.
+
+=back
+
+=head1 SEE ALSO
+
+B<pkg>(1), B<pkg>(5), B<Term::ANSIColor>.
+
+=cut
